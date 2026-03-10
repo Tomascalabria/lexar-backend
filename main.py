@@ -600,77 +600,95 @@ async def obtener_ley(norma_id: int):
 async def proyectos_diputados(
     q: str = Query(..., description="Término de búsqueda"),
     anio: Optional[int] = Query(None),
-    tipo: Optional[str] = Query(None, description="LEY, RESOLUCION, DECLARACION, etc."),
+    tipo: Optional[str] = Query(None),
 ):
-    """Scrapea el buscador de proyectos de Diputados."""
-    cached = cache_get(f"diputados:{q}:{anio}:{tipo}")
+    """Busca proyectos en Diputados via su buscador público."""
+    cache_key = f"diputados:{q}:{anio}"
+    cached = cache_get(cache_key)
     if cached:
         return cached
 
-    # El buscador de diputados acepta GET con estos params
-    url = "https://www.diputados.gov.ar/proyectos/proyectosbusqueda.json"
-    params = {
-        "tipo": tipo or "todos",
-        "estado": "todos",
-        "palabras": q,
-        "fechaDesde": f"01/01/{anio}" if anio else "",
-        "fechaHasta": "",
-    }
-
     resultados = []
-    try:
-        async with httpx.AsyncClient(timeout=25, headers=HEADERS, follow_redirects=True) as client:
-            # Intento 1: endpoint JSON no documentado
-            r = await client.get(url, params=params)
-            if r.status_code == 200 and r.headers.get("content-type", "").startswith("application/json"):
-                data = r.json()
-                resultados = data.get("proyectos", data if isinstance(data, list) else [])
-            else:
-                # Intento 2: scraping HTML del formulario
-                resultados = await _scrape_diputados_html(q, anio, tipo, client)
-    except Exception as e:
-        resultados = await _scrape_diputados_html_fallback(q, anio, tipo)
 
-    cache_set(f"diputados:{q}:{anio}:{tipo}", resultados)
+    try:
+        async with httpx.AsyncClient(timeout=30, headers=HEADERS, follow_redirects=True) as client:
+            # URL del buscador público de Diputados
+            url = "https://www.diputados.gov.ar/proyectos/proyectos.html"
+            params = {
+                "strModo": "busqueda",
+                "strTipoDocumento": "todos",
+                "strCamaraOrigen": "AMBAS",
+                "strPeriodoInicio": str(anio) if anio else "",
+                "strPeriodoFin": "",
+                "strNumExpediente": "",
+                "strAutor": "",
+                "strTema": q,
+            }
+            r = await client.get(url, params=params, timeout=25)
+            soup = BeautifulSoup(r.text, "html.parser")
+
+            # Intentar tabla principal
+            tabla = soup.find("table", {"class": lambda c: c and ("table" in c or "proyecto" in c.lower())})
+            if not tabla:
+                tabla = soup.find("table")
+
+            if tabla:
+                filas = tabla.find_all("tr")[1:26]  # máx 25
+                for row in filas:
+                    cols = row.find_all("td")
+                    if len(cols) < 2:
+                        continue
+                    link = row.find("a")
+                    textos = [c.get_text(strip=True) for c in cols]
+                    # Heurística: el texto más largo suele ser el título
+                    titulo = max(textos, key=len) if textos else ""
+                    exp = textos[0] if textos else ""
+                    resultados.append({
+                        "expediente": exp,
+                        "titulo": titulo,
+                        "autores": textos[2] if len(textos) > 2 else "",
+                        "fecha": textos[1] if len(textos) > 1 else "",
+                        "url": ("https://www.diputados.gov.ar" + link["href"]) if link and link.get("href", "").startswith("/") else (link["href"] if link else None),
+                        "camara": "Diputados",
+                    })
+
+            # Si no hay tabla, intentar con el buscador alternativo
+            if not resultados:
+                url2 = "https://www.diputados.gov.ar/proyectos/resultado.html"
+                form_data = {
+                    "strModo": "busqueda",
+                    "strTipoDocumento": "todos",
+                    "strCamaraOrigen": "AMBAS",
+                    "strPeriodoInicio": str(anio) if anio else "",
+                    "strTema": q,
+                    "btnBuscar": "Buscar",
+                }
+                r2 = await client.post(url2, data=form_data, timeout=25)
+                soup2 = BeautifulSoup(r2.text, "html.parser")
+                for row in soup2.find_all("tr")[1:26]:
+                    cols = row.find_all("td")
+                    if len(cols) < 2:
+                        continue
+                    link = row.find("a")
+                    textos = [c.get_text(strip=True) for c in cols]
+                    titulo = max(textos, key=len) if textos else ""
+                    resultados.append({
+                        "expediente": textos[0] if textos else "",
+                        "titulo": titulo,
+                        "autores": textos[2] if len(textos) > 2 else "",
+                        "fecha": textos[1] if len(textos) > 1 else "",
+                        "url": ("https://www.diputados.gov.ar" + link["href"]) if link and link.get("href", "").startswith("/") else None,
+                        "camara": "Diputados",
+                    })
+
+    except Exception as e:
+        resultados = [{"error": f"No se pudo conectar con Diputados: {str(e)[:120]}"}]
+
+    # Filtrar filas vacías o sin título real
+    resultados = [r for r in resultados if r.get("titulo") and len(r["titulo"]) > 5]
+
+    cache_set(cache_key, resultados)
     return resultados
-
-
-async def _scrape_diputados_html(q: str, anio: Optional[int], tipo: Optional[str], client) -> list:
-    """Scraping HTML del buscador de Diputados."""
-    url = "https://www.diputados.gov.ar/proyectos/resultado.html"
-    data = {
-        "chkTipoDocumento[]": tipo or "DL",
-        "strCamaraOrigen": "AMBAS",
-        "strPeriodoInicio": str(anio) if anio else "",
-        "strTema": q,
-        "btnBuscar": "Buscar",
-    }
-    try:
-        r = await client.post(url, data=data, timeout=20)
-        soup = BeautifulSoup(r.text, "html.parser")
-        proyectos = []
-        for row in soup.select("table.table-bordered tr")[1:21]:
-            cols = row.find_all("td")
-            if len(cols) >= 5:
-                link = cols[0].find("a")
-                exp = cols[0].text.strip()
-                proyectos.append({
-                    "expediente": exp,
-                    "tipo": cols[1].text.strip(),
-                    "titulo": cols[4].text.strip(),
-                    "autores": cols[2].text.strip(),
-                    "fecha": cols[3].text.strip(),
-                    "url": f"https://www.diputados.gov.ar{link['href']}" if link else None,
-                    "camara": "Diputados",
-                })
-        return proyectos
-    except Exception as e:
-        return [{"error": f"Diputados no responde: {str(e)}", "sugerencia": "Intentar más tarde"}]
-
-
-async def _scrape_diputados_html_fallback(q: str, anio: Optional[int], tipo: Optional[str]) -> list:
-    async with httpx.AsyncClient(timeout=20, headers=HEADERS, follow_redirects=True) as client:
-        return await _scrape_diputados_html(q, anio, tipo, client)
 
 
 # ─── Proyectos en Senado ──────────────────────────────────────────────────────
@@ -680,40 +698,62 @@ async def proyectos_senado(
     q: str = Query(...),
     anio: Optional[int] = Query(None),
 ):
-    """Scrapea el buscador de proyectos del Senado."""
-    cached = cache_get(f"senado:{q}:{anio}")
+    """Busca proyectos en el Senado via su buscador público."""
+    cache_key = f"senado:{q}:{anio}"
+    cached = cache_get(cache_key)
     if cached:
         return cached
 
-    url = "https://www.senado.gob.ar/parlamentario/parlamentaria/busquedaAvanzada/search"
-    params = {
-        "pageNum": 1,
-        "orderBy": "fecha",
-        "tipoDoc": "PL",  # Proyectos de Ley
-        "textoBusqueda": q,
-        "anio": anio or "",
-    }
-
     resultados = []
     try:
-        async with httpx.AsyncClient(timeout=25, headers=HEADERS, follow_redirects=True) as client:
-            r = await client.get(url, params=params)
-            soup = BeautifulSoup(r.text, "html.parser")
-            for row in soup.select(".resultado-item, .search-result, table tr")[1:20]:
-                cols = row.find_all("td")
-                if len(cols) >= 3:
-                    link = row.find("a")
-                    resultados.append({
-                        "expediente": cols[0].text.strip() if cols else "",
-                        "titulo": cols[-1].text.strip() if cols else row.text.strip()[:200],
-                        "fecha": cols[1].text.strip() if len(cols) > 1 else "",
-                        "url": f"https://www.senado.gob.ar{link['href']}" if link and link.get("href") else None,
-                        "camara": "Senado",
-                    })
-    except Exception as e:
-        resultados = [{"error": f"Senado no responde: {str(e)}"}]
+        async with httpx.AsyncClient(timeout=30, headers=HEADERS, follow_redirects=True) as client:
+            # Buscador del Senado
+            url = "https://www.senado.gob.ar/parlamentario/parlamentaria/busquedaAvanzada/search"
+            params = {
+                "pageNum": 1,
+                "orderBy": "fecha",
+                "tipoDoc": "PL",
+                "textoBusqueda": q,
+            }
+            if anio:
+                params["anio"] = anio
 
-    cache_set(f"senado:{q}:{anio}", resultados)
+            r = await client.get(url, params=params, timeout=25)
+            soup = BeautifulSoup(r.text, "html.parser")
+
+            # El Senado usa una tabla con clase específica
+            filas = soup.select("table tr")[1:26]
+            if not filas:
+                # Intentar selectores alternativos
+                filas = soup.select(".resultado tr, .busqueda-resultado tr, tr")[1:26]
+
+            for row in filas:
+                cols = row.find_all("td")
+                if len(cols) < 2:
+                    continue
+                link = row.find("a")
+                textos = [c.get_text(strip=True) for c in cols]
+                titulo = max(textos, key=len) if textos else ""
+                if len(titulo) < 5:
+                    continue
+                href = link["href"] if link else ""
+                full_url = None
+                if href:
+                    full_url = href if href.startswith("http") else f"https://www.senado.gob.ar{href}"
+                resultados.append({
+                    "expediente": textos[0] if textos else "",
+                    "titulo": titulo,
+                    "fecha": textos[1] if len(textos) > 1 else "",
+                    "autores": textos[2] if len(textos) > 2 else "",
+                    "url": full_url,
+                    "camara": "Senado",
+                })
+
+    except Exception as e:
+        resultados = [{"error": f"No se pudo conectar con el Senado: {str(e)[:120]}"}]
+
+    resultados = [r for r in resultados if r.get("titulo") and len(r["titulo"]) > 5]
+    cache_set(cache_key, resultados)
     return resultados
 
 
@@ -828,9 +868,16 @@ async def comparar_leyes(req: ComparadorRequest):
     Llama a la API de Anthropic (Claude) para comparar dos normas.
     La API key se lee de la variable de entorno ANTHROPIC_KEY.
     """
-    api_key = os.environ.get("ANTHROPIC_KEY") or os.environ.get("ANTHROPIC_API_KEY")
+    api_key = (
+        os.environ.get("ANTHROPIC_KEY")
+        or os.environ.get("ANTHROPIC_API_KEY")
+        or os.environ.get("CLAUDE_API_KEY")
+        or os.environ.get("API_KEY_ANTHROPIC")
+    )
     if not api_key:
-        raise HTTPException(500, detail="ANTHROPIC_KEY no configurada en Railway Variables")
+        # Listar variables disponibles para debug (sin mostrar valores)
+        env_keys = [k for k in os.environ.keys() if "anthrop" in k.lower() or "claude" in k.lower() or "api" in k.lower()]
+        raise HTTPException(500, detail=f"API key no encontrada. Variables relacionadas en el entorno: {env_keys or 'ninguna. Agregá ANTHROPIC_KEY en Railway → Variables'}")
 
     prompt = f"""Sos un experto en derecho argentino. Compará estas dos normas en 4 puntos concisos:
 1. Relación entre ambas normas
@@ -867,3 +914,52 @@ LEY B: {req.ley_b_titulo} ({req.ley_b_tipo} {req.ley_b_numero})
     data = r.json()
     texto = "".join(b.get("text", "") for b in data.get("content", []))
     return {"analisis": texto}
+
+# ─── Lector de PDF ────────────────────────────────────────────────────────────
+
+class PDFRequest(BaseModel):
+    base64: str
+    nombre: str = "documento.pdf"
+
+@app.post("/api/leer-pdf")
+async def leer_pdf(req: PDFRequest):
+    """
+    Recibe un PDF en base64, extrae el texto con pypdf y lo devuelve.
+    """
+    import base64 as b64
+    import io
+
+    try:
+        pdf_bytes = b64.b64decode(req.base64)
+    except Exception:
+        raise HTTPException(400, detail="base64 inválido")
+
+    texto = ""
+    try:
+        import pypdf
+        reader = pypdf.PdfReader(io.BytesIO(pdf_bytes))
+        partes = []
+        for page in reader.pages:
+            t = page.extract_text()
+            if t:
+                partes.append(t.strip())
+        texto = "\n\n".join(partes)
+    except ImportError:
+        # pypdf no instalado — intentar con pdfminer
+        try:
+            from pdfminer.high_level import extract_text as pdfminer_extract
+            texto = pdfminer_extract(io.BytesIO(pdf_bytes))
+        except ImportError:
+            raise HTTPException(501, detail="Ninguna librería PDF disponible (pypdf / pdfminer.six)")
+    except Exception as e:
+        raise HTTPException(500, detail=f"Error al leer PDF: {str(e)}")
+
+    if not texto.strip():
+        raise HTTPException(422, detail="El PDF no contiene texto extraíble (puede ser escaneado/imagen)")
+
+    return {
+        "nombre": req.nombre,
+        "texto": texto[:20000],        # máximo 20k chars para el análisis
+        "total_chars": len(texto),
+        "paginas": len(pypdf.PdfReader(io.BytesIO(b64.b64decode(req.base64))).pages) if "pypdf" in dir() else None,
+    }
