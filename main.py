@@ -321,41 +321,31 @@ def get_leyes_destacadas_list() -> list:
         for ley in LEYES_DESTACADAS
     ]
 
-# ─── Descarga del CSV de Infoleg ──────────────────────────────────────────────
+# ─── Carga del CSV muestreo de Infoleg (datos.jus.gob.ar) ────────────────────
+# URL directa del muestreo (1000 registros, ~80KB, sin redirect)
+CSV_MUESTREO_URL = "https://datos.jus.gob.ar/dataset/d9a963ea-8b1d-4ca3-9dd9-07a4773e8c23/resource/8b1c2310-564e-41e6-9a84-99cfa9939bbc/download/base-infoleg-normativa-nacional-muestreo.csv"
 
-CSV_URL = "https://datos.gob.ar/dataset/jus-base-infoleg-normativa-nacional/archivo/jus_01"
 _normas_db: list[dict] = []
 _normas_loaded = False
 
 async def load_normas_csv():
-    """Descarga y parsea el CSV de infoleg una vez al arrancar."""
+    """Descarga el CSV muestreo de datos.jus.gob.ar al arrancar."""
     global _normas_db, _normas_loaded
     if _normas_loaded:
         return
-
-    # Intentar desde datos.gob.ar directo
-    csv_urls = [
-        "https://infra.datos.gob.ar/catalog/jus/dataset/1/distribution/1.1/download/base-infoleg-normativa-nacional.csv",
-        "https://datos.gob.ar/dataset/jus-base-infoleg-normativa-nacional/archivo/jus_01",
-    ]
-
-    async with httpx.AsyncClient(timeout=60, headers=HEADERS, follow_redirects=True) as client:
-        for url in csv_urls:
-            try:
-                r = await client.get(url)
-                if r.status_code == 200:
-                    content = r.text
-                    reader = csv.DictReader(io.StringIO(content))
-                    _normas_db = [row for row in reader]
-                    _normas_loaded = True
-                    print(f"✅ CSV cargado: {len(_normas_db)} normas")
-                    return
-            except Exception as e:
-                print(f"⚠️  Error con {url}: {e}")
-                continue
-
-    print("⚠️  No se pudo cargar CSV, búsqueda degradada a scraping directo")
-    _normas_loaded = True
+    try:
+        async with httpx.AsyncClient(timeout=30, headers=HEADERS, follow_redirects=True) as client:
+            r = await client.get(CSV_MUESTREO_URL)
+            if r.status_code == 200:
+                reader = csv.DictReader(io.StringIO(r.text))
+                _normas_db = [row for row in reader]
+                print(f"✅ CSV muestreo cargado: {len(_normas_db)} normas")
+            else:
+                print(f"⚠️  CSV muestreo: HTTP {r.status_code}")
+    except Exception as e:
+        print(f"⚠️  No se pudo cargar CSV muestreo: {e}")
+    finally:
+        _normas_loaded = True
 
 
 @app.on_event("startup")
@@ -366,42 +356,136 @@ async def startup():
 # ─── Búsqueda de normas ───────────────────────────────────────────────────────
 
 def normalizar(texto: str) -> str:
-    """Quita tildes y pasa a minúsculas para comparar."""
     return ''.join(
         c for c in unicodedata.normalize('NFD', texto.lower())
         if unicodedata.category(c) != 'Mn'
     )
 
+
+async def _buscar_infoleg_scraping(q: str, tipo: Optional[str], limit: int) -> list:
+    """
+    Scraping del buscador real de Infoleg.
+    URL: servicios.infoleg.gob.ar — el mismo que usa la web oficial.
+    """
+    resultados = []
+    try:
+        async with httpx.AsyncClient(timeout=25, headers=HEADERS, follow_redirects=True) as client:
+            # El buscador de Infoleg usa un form POST
+            url = "https://servicios.infoleg.gob.ar/infolegInternet/buscar.do"
+            data = {
+                "METHOD": "buscar",
+                "TIPO_NORMA": tipo.upper() if tipo else "",
+                "NUMERO": "",
+                "ANIO": "",
+                "ORGANISMO": "",
+                "TITULO_SUMARIO": q,
+                "TEXTO_ACTIVO": "true",
+                "btnBuscar": "Buscar",
+            }
+            r = await client.post(url, data=data, timeout=20)
+            soup = BeautifulSoup(r.text, "html.parser")
+
+            # La tabla de resultados de Infoleg
+            tabla = soup.find("table", {"class": "table"}) or soup.find("table")
+            if tabla:
+                filas = tabla.find_all("tr")[1:limit+1]
+                for row in filas:
+                    cols = row.find_all("td")
+                    if len(cols) < 3:
+                        continue
+                    link = row.find("a")
+                    norma_id = None
+                    href = link.get("href", "") if link else ""
+                    m = re.search(r"id=(\d+)", href)
+                    if m:
+                        norma_id = int(m.group(1))
+                    # Columnas típicas: tipo | número | fecha | título
+                    tipo_val   = cols[0].get_text(strip=True)
+                    numero_val = cols[1].get_text(strip=True) if len(cols) > 1 else ""
+                    fecha_val  = cols[2].get_text(strip=True) if len(cols) > 2 else ""
+                    titulo_val = cols[3].get_text(strip=True) if len(cols) > 3 else cols[-1].get_text(strip=True)
+                    if not titulo_val or len(titulo_val) < 4:
+                        continue
+                    resultados.append({
+                        "id": norma_id,
+                        "tipo": tipo_val,
+                        "numero": numero_val,
+                        "fecha": fecha_val,
+                        "titulo": titulo_val,
+                        "organismo": "",
+                        "url_infoleg": infoleg_meta_url(norma_id) if norma_id else None,
+                        "url_texto": infoleg_texto_url(norma_id) if norma_id else None,
+                        "fuente": "infoleg_scraping",
+                    })
+
+            # Si la tabla no funcionó, buscar via argentina.gob.ar/normativa
+            if not resultados:
+                url2 = "https://www.argentina.gob.ar/normativa/buscar"
+                params2 = {"keywords": q, "tipo": tipo or ""}
+                r2 = await client.get(url2, params=params2)
+                soup2 = BeautifulSoup(r2.text, "html.parser")
+                for item in soup2.select(".normativa-item, .search-result-item, article")[:limit]:
+                    titulo_el = item.find("h2") or item.find("h3") or item.find("a")
+                    if not titulo_el:
+                        continue
+                    titulo = titulo_el.get_text(strip=True)
+                    link2 = item.find("a")
+                    href2 = link2.get("href", "") if link2 else ""
+                    m2 = re.search(r"/(\d{5,})/", href2)
+                    norma_id2 = int(m2.group(1)) if m2 else None
+                    resultados.append({
+                        "id": norma_id2,
+                        "tipo": "",
+                        "numero": "",
+                        "fecha": "",
+                        "titulo": titulo,
+                        "organismo": "",
+                        "url_infoleg": infoleg_meta_url(norma_id2) if norma_id2 else None,
+                        "fuente": "argentina_gob_scraping",
+                    })
+
+    except Exception as e:
+        print(f"⚠️  Scraping Infoleg falló: {e}")
+
+    return resultados
+
+
 @app.get("/api/buscar")
 async def buscar_normas(
-    q: str = Query(..., min_length=2, description="Texto a buscar"),
-    tipo: Optional[str] = Query(None, description="LEY, DECRETO, RESOLUCION, etc."),
-    limit: int = Query(20, le=50),
+    q: str = Query(..., min_length=2),
+    tipo: Optional[str] = Query(None),
+    limit: int = Query(25, le=50),
 ):
     """
-    Busca normas. Estrategia en cascada:
-    1. Catálogo curado (inmediato, siempre funciona)
-    2. CSV de datos.gob.ar (si cargó)
-    3. Scraping directo de infoleg (último recurso)
+    Busca normas en cascada:
+    1. Catálogo curado interno (siempre disponible, respuesta inmediata)
+    2. CSV muestreo de datos.jus.gob.ar (1000 normas, cargado al arrancar)
+    3. Scraping directo del buscador de Infoleg (tiempo real, cualquier norma)
     """
-    cached = cache_get(f"buscar:{q}:{tipo}")
+    cache_key = f"buscar:{q}:{tipo}"
+    cached = cache_get(cache_key)
     if cached:
         return cached
 
     q_norm = normalizar(q)
     resultados = []
+    ids_vistos: set = set()
 
-    # ── 1. Catálogo curado — siempre disponible, respuesta inmediata ──
+    # ── 1. Catálogo curado ──────────────────────────────────────────────────
     for ley in LEYES_DESTACADAS:
         titulo  = ley.get("titulo", "")
         tags    = " ".join(ley.get("tags", []))
         resumen = ley.get("resumen", "")
-        if (q_norm in normalizar(titulo) or
+        match = (
+            q_norm in normalizar(titulo) or
             q_norm in normalizar(tags) or
             q_norm in normalizar(resumen) or
-            q_norm in normalizar(ley.get("numero", ""))):
+            q_norm in normalizar(str(ley.get("numero", "")))
+        )
+        if match:
             if tipo and ley.get("tipo", "").upper() != tipo.upper():
                 continue
+            ids_vistos.add(ley["id"])
             resultados.append({
                 "id": ley["id"],
                 "tipo": ley.get("tipo", ""),
@@ -417,79 +501,50 @@ async def buscar_normas(
                 "fuente": "catalogo_curado",
             })
 
-    # ── 2. CSV de datos.gob.ar (si cargó) ──
+    # ── 2. CSV muestreo ─────────────────────────────────────────────────────
     if _normas_db:
-        ids_ya = {r["id"] for r in resultados}
         for row in _normas_db:
-            titulo = row.get("titulo_sumario", "") or row.get("titulo_resumido", "")
-            if q_norm in normalizar(titulo):
-                if tipo and row.get("tipo_norma", "").upper() != tipo.upper():
-                    continue
-                try:
-                    norma_id = int(row.get("id_norma") or row.get("norma_id") or 0)
-                except (TypeError, ValueError):
-                    continue
-                if norma_id in ids_ya or norma_id == 0:
-                    continue
-                resultados.append({
-                    "id": norma_id,
-                    "tipo": row.get("tipo_norma", ""),
-                    "numero": row.get("numero_norma", ""),
-                    "organismo": row.get("organismo_origen", ""),
-                    "fecha": row.get("fecha_boletin", ""),
-                    "titulo": titulo,
-                    "url_infoleg": infoleg_meta_url(norma_id),
-                    "url_texto": infoleg_texto_url(norma_id),
-                    "fuente": "csv_infoleg",
-                })
-                if len(resultados) >= limit:
-                    break
+            titulo = (row.get("titulo_sumario") or row.get("titulo_resumido") or "").strip()
+            if not titulo or q_norm not in normalizar(titulo):
+                continue
+            if tipo and row.get("tipo_norma", "").upper() != tipo.upper():
+                continue
+            try:
+                norma_id = int(row.get("id_norma") or row.get("norma_id") or 0)
+            except (TypeError, ValueError):
+                continue
+            if norma_id == 0 or norma_id in ids_vistos:
+                continue
+            ids_vistos.add(norma_id)
+            resultados.append({
+                "id": norma_id,
+                "tipo": row.get("tipo_norma", ""),
+                "numero": row.get("numero_norma", ""),
+                "organismo": row.get("organismo_origen", ""),
+                "fecha": row.get("fecha_boletin", ""),
+                "titulo": titulo,
+                "url_infoleg": infoleg_meta_url(norma_id),
+                "url_texto": infoleg_texto_url(norma_id),
+                "fuente": "csv_muestreo",
+            })
+            if len(resultados) >= limit:
+                break
 
-    # ── 3. Scraping directo de infoleg si no hay nada todavía ──
-    if not resultados:
-        resultados = await _scrape_busqueda_infoleg(q, tipo, limit)
+    # ── 3. Scraping Infoleg — siempre se ejecuta para dar resultados reales ──
+    scraped = await _buscar_infoleg_scraping(q, tipo, limit)
+    for item in scraped:
+        nid = item.get("id")
+        if nid and nid in ids_vistos:
+            continue
+        if nid:
+            ids_vistos.add(nid)
+        resultados.append(item)
+        if len(resultados) >= limit:
+            break
 
     resultados = resultados[:limit]
-    cache_set(f"buscar:{q}:{tipo}", resultados)
+    cache_set(cache_key, resultados)
     return resultados
-
-
-async def _scrape_busqueda_infoleg(q: str, tipo: Optional[str], limit: int) -> list:
-    """Scraping directo del buscador de infoleg como fallback."""
-    url = "https://servicios.infoleg.gob.ar/infolegInternet/buscar.do"
-    params = {
-        "METHOD": "buscar",
-        "TIPO_NORMA": tipo or "",
-        "NUMERO": "",
-        "ANIO": "",
-        "ORGANISMO": "",
-        "TITULO_SUMARIO": q,
-        "TEXTO_ACTIVO": "true",
-    }
-    try:
-        async with httpx.AsyncClient(timeout=20, headers=HEADERS) as client:
-            r = await client.get(url, params=params)
-            soup = BeautifulSoup(r.text, "html.parser")
-            resultados = []
-            for row in soup.select("table.table tr")[1:limit+1]:
-                cols = row.find_all("td")
-                if len(cols) >= 4:
-                    link = cols[0].find("a")
-                    norma_id = None
-                    if link and "id=" in link.get("href", ""):
-                        norma_id = re.search(r"id=(\d+)", link["href"])
-                        norma_id = int(norma_id.group(1)) if norma_id else None
-                    resultados.append({
-                        "id": norma_id,
-                        "tipo": cols[0].text.strip(),
-                        "numero": cols[1].text.strip(),
-                        "fecha": cols[2].text.strip(),
-                        "titulo": cols[3].text.strip(),
-                        "url_infoleg": infoleg_meta_url(norma_id) if norma_id else None,
-                    })
-            return resultados
-    except Exception as e:
-        return [{"error": str(e)}]
 
 
 # ─── Texto completo de una ley ────────────────────────────────────────────────
@@ -846,7 +901,7 @@ async def catalogo_item(norma_id: int):
     raise HTTPException(404, detail=f"Ley {norma_id} no en catálogo curado")
 
 
-# ─── Comparador con IA ────────────────────────────────────────────────────────
+# ─── Modelos Pydantic ─────────────────────────────────────────────────────────
 
 from pydantic import BaseModel
 
@@ -862,36 +917,54 @@ class ComparadorRequest(BaseModel):
     ley_b_resumen: str
     ley_b_reforma: str = ""
 
-@app.post("/api/comparar")
-async def comparar_leyes(req: ComparadorRequest):
-    """
-    Llama a la API de Anthropic (Claude) para comparar dos normas.
-    La API key se lee de la variable de entorno ANTHROPIC_KEY.
-    """
-    api_key = (
+class BuscarIARequest(BaseModel):
+    q: str  # ej: "ley de glaciares", "contrato de trabajo", "defensa del consumidor"
+
+
+def _get_api_key():
+    key = (
         os.environ.get("ANTHROPIC_KEY")
         or os.environ.get("ANTHROPIC_API_KEY")
         or os.environ.get("CLAUDE_API_KEY")
-        or os.environ.get("API_KEY_ANTHROPIC")
     )
-    if not api_key:
-        # Listar variables disponibles para debug (sin mostrar valores)
-        env_keys = [k for k in os.environ.keys() if "anthrop" in k.lower() or "claude" in k.lower() or "api" in k.lower()]
-        raise HTTPException(500, detail=f"API key no encontrada. Variables relacionadas en el entorno: {env_keys or 'ninguna. Agregá ANTHROPIC_KEY en Railway → Variables'}")
+    if not key:
+        env_keys = [k for k in os.environ if "anthrop" in k.lower() or "claude" in k.lower()]
+        raise HTTPException(500, detail=f"ANTHROPIC_KEY no configurada en Railway. Variables encontradas: {env_keys or 'ninguna'}")
+    return key
 
-    prompt = f"""Sos un experto en derecho argentino. Compará estas dos normas en 4 puntos concisos:
-1. Relación entre ambas normas
-2. Posibles conflictos o superposiciones
-3. Cuál prevalece en caso de conflicto y por qué
-4. Contexto político-jurídico actual de cada una
 
-LEY A: {req.ley_a_titulo} ({req.ley_a_tipo} {req.ley_a_numero})
-{req.ley_a_resumen}
-{("Reforma propuesta: " + req.ley_a_reforma) if req.ley_a_reforma else ""}
+# ─── Búsqueda de leyes con Claude + web_search ────────────────────────────────
 
-LEY B: {req.ley_b_titulo} ({req.ley_b_tipo} {req.ley_b_numero})
-{req.ley_b_resumen}
-{("Reforma propuesta: " + req.ley_b_reforma) if req.ley_b_reforma else ""}"""
+@app.post("/api/buscar-ia")
+async def buscar_con_ia(req: BuscarIARequest):
+    """
+    Usa Claude con web_search para encontrar la ley solicitada en Infoleg
+    y devuelve: título, número, ID Infoleg, URL del texto y resumen.
+    """
+    api_key = _get_api_key()
+
+    prompt = f"""Buscá información sobre esta norma argentina: "{req.q}"
+
+Necesito que uses web_search para encontrarla en infoleg.gob.ar o servicios.infoleg.gob.ar.
+
+Devolvé SOLO un JSON con este formato exacto, sin texto adicional, sin markdown:
+{{
+  "resultados": [
+    {{
+      "titulo": "título completo de la ley",
+      "tipo": "LEY / DECRETO / RESOLUCION",
+      "numero": "número de la norma",
+      "anio": "año de sanción",
+      "infoleg_id": 12345,
+      "url_texto": "https://servicios.infoleg.gob.ar/infolegInternet/anexos/...",
+      "url_infoleg": "https://servicios.infoleg.gob.ar/infolegInternet/verNorma.do?id=...",
+      "resumen": "resumen breve de qué regula esta ley"
+    }}
+  ]
+}}
+
+Incluí hasta 5 resultados relevantes. Si no encontrás el ID exacto de Infoleg, poné null en infoleg_id.
+Priorizá resultados de servicios.infoleg.gob.ar."""
 
     async with httpx.AsyncClient(timeout=60) as client:
         r = await client.post(
@@ -903,16 +976,98 @@ LEY B: {req.ley_b_titulo} ({req.ley_b_tipo} {req.ley_b_numero})
             },
             json={
                 "model": "claude-sonnet-4-20250514",
-                "max_tokens": 1200,
+                "max_tokens": 2000,
+                "tools": [{"type": "web_search_20250305", "name": "web_search"}],
                 "messages": [{"role": "user", "content": prompt}],
             },
         )
 
     if r.status_code != 200:
-        raise HTTPException(502, detail=f"Error de Anthropic: {r.text[:200]}")
+        raise HTTPException(502, detail=f"Error Claude: {r.text[:300]}")
 
     data = r.json()
-    texto = "".join(b.get("text", "") for b in data.get("content", []))
+
+    # Extraer texto de todos los bloques de contenido
+    texto = ""
+    for block in data.get("content", []):
+        if block.get("type") == "text":
+            texto += block.get("text", "")
+
+    # Limpiar posibles markdown fences
+    texto_limpio = re.sub(r"```(?:json)?|```", "", texto).strip()
+
+    # Intentar parsear JSON
+    try:
+        # Buscar el objeto JSON dentro del texto
+        m = re.search(r'\{[\s\S]*"resultados"[\s\S]*\}', texto_limpio)
+        if m:
+            parsed = json.loads(m.group(0))
+            resultados = parsed.get("resultados", [])
+        else:
+            resultados = json.loads(texto_limpio).get("resultados", [])
+    except Exception:
+        # Si no parsea, devolver como texto libre para debug
+        return {"resultados": [], "raw": texto_limpio[:500]}
+
+    # Enriquecer con URL de texto si tenemos el ID
+    for item in resultados:
+        if item.get("infoleg_id"):
+            try:
+                nid = int(item["infoleg_id"])
+                if not item.get("url_texto"):
+                    item["url_texto"] = infoleg_texto_url(nid)
+                if not item.get("url_infoleg"):
+                    item["url_infoleg"] = infoleg_meta_url(nid)
+                item["id"] = nid
+            except (ValueError, TypeError):
+                pass
+
+    return {"resultados": resultados, "query": req.q}
+
+
+# ─── Comparador con IA ────────────────────────────────────────────────────────
+
+@app.post("/api/comparar")
+async def comparar_leyes(req: ComparadorRequest):
+    """Llama a Claude para comparar dos normas. API key desde variable de entorno."""
+    api_key = _get_api_key()
+
+    prompt = f"""Sos un experto en derecho argentino. Compará estas dos normas en 4 puntos concisos:
+1. Relación entre ambas normas
+2. Principales diferencias y cambios que introduce B respecto de A
+3. Cuál prevalece en caso de conflicto y por qué
+4. Impacto práctico y contexto político-jurídico actual
+
+LEY / NORMA A (VIGENTE): {req.ley_a_titulo} ({req.ley_a_tipo} {req.ley_a_numero})
+{req.ley_a_resumen}
+{("Reforma propuesta: " + req.ley_a_reforma) if req.ley_a_reforma else ""}
+
+LEY / NORMA B (REFORMA O COMPARAR): {req.ley_b_titulo} ({req.ley_b_tipo} {req.ley_b_numero})
+{req.ley_b_resumen}
+{("Cambios: " + req.ley_b_reforma) if req.ley_b_reforma else ""}
+
+Respondé en español, de forma clara y directa. Usá los 4 puntos numerados."""
+
+    async with httpx.AsyncClient(timeout=60) as client:
+        r = await client.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "Content-Type": "application/json",
+                "x-api-key": api_key,
+                "anthropic-version": "2023-06-01",
+            },
+            json={
+                "model": "claude-sonnet-4-20250514",
+                "max_tokens": 1500,
+                "messages": [{"role": "user", "content": prompt}],
+            },
+        )
+
+    if r.status_code != 200:
+        raise HTTPException(502, detail=f"Error Anthropic: {r.text[:300]}")
+
+    data = r.json()
+    texto = "".join(b.get("text", "") for b in data.get("content", []) if b.get("type") == "text")
     return {"analisis": texto}
 
 # ─── Lector de PDF ────────────────────────────────────────────────────────────
